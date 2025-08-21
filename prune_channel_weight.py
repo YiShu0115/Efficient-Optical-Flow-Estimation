@@ -10,6 +10,11 @@ import copy
 import os
 from data_prune import MyFlowDataset
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm import tqdm
+from torch.utils.data.distributed import DistributedSampler
+
 from lightning.pytorch import seed_everything
  
 seed_everything(3407, workers=True)
@@ -25,6 +30,9 @@ def get_args_parser():
                         help='dataset used for the model')
     parser.add_argument('--resume', default='neuflow_things.pth', type=str,
                     help='resume from pretrain model for finetuing or resume from terminated training')
+    parser.add_argument('--distributed', action='store_true')
+    parser.add_argument('--batch_size', default=32, type=int)
+    parser.add_argument('--local_rank', default=0, type=int)
     return parser
 parser = get_args_parser()
 args = parser.parse_args()
@@ -41,7 +49,7 @@ class SingleInputBackbone(nn.Module):
         return self.backbone(img)
         
 
-def structured_prune_model(model, image1, image2, device, prune_ratio=0.01):
+def structured_prune_model(model, image1, image2, device, prune_ratio_1=0.1,prune_ratio_2=0.02):
     # 0. 准备工作
     model.eval()
     dummy_input = torch.cat([image1, image2], dim=0)
@@ -66,7 +74,7 @@ def structured_prune_model(model, image1, image2, device, prune_ratio=0.01):
         backbone,
         dummy_input,
         importance=imp,
-        pruning_ratio=prune_ratio, # remove 50% channels, ResNet18 = {64, 128, 256, 512} => ResNet18_Half = {32, 64, 128, 256}
+        pruning_ratio=prune_ratio_1, # remove 50% channels, ResNet18 = {64, 128, 256, 512} => ResNet18_Half = {32, 64, 128, 256}
         # pruning_ratio_dict = {model.conv1: 0.2, model.layer2: 0.8}, # customized pruning ratios for layers or blocks
         ignored_layers=ignored_layers,
         round_to=8, # It's recommended to round dims/channels to 4x or 8x for acceleration. Please see: https://docs.nvidia.com/deeplearning/performance/dl-performance-convolutional/index.html
@@ -83,43 +91,43 @@ def structured_prune_model(model, image1, image2, device, prune_ratio=0.01):
     model.backbone = backbone.backbone
     
     
-    # refine_1 = model.refine_s16.to(device)  # 需要你实现 SingleInputRefine 来适配 refine 的输入
-    # pruner_refine = tp.pruner.BasePruner(
-    #     refine_1,
-    #     dummy_input_refine1.unsqueeze(dim=0),
-    #     importance=imp,
-    #     pruning_ratio=prune_ratio,
-    #     # ignored_layers=ignored_layers_refine,
-    #     round_to=8,
-    # )
+    refine_1 = model.refine_s16.to(device)  # 需要你实现 SingleInputRefine 来适配 refine 的输入
+    pruner_refine = tp.pruner.BasePruner(
+        refine_1,
+        dummy_input_refine1.unsqueeze(dim=0),
+        importance=imp,
+        pruning_ratio=prune_ratio_2,
+        # ignored_layers=ignored_layers_refine,
+        round_to=8,
+    )
 
-    # print("=== 剪 refine 前 ===")
-    # tp.utils.print_tool.before_pruning(refine_1)
-    # pruner_refine.step()
-    # print("=== 剪 refine 后 ===")
-    # tp.utils.print_tool.after_pruning(refine_1)
+    print("=== 剪 refine 前 ===")
+    tp.utils.print_tool.before_pruning(refine_1)
+    pruner_refine.step()
+    print("=== 剪 refine 后 ===")
+    tp.utils.print_tool.after_pruning(refine_1)
 
-    # # 把剪过的 refine 挂回原模型
-    # model.refine_s16 = refine_1
+    # 把剪过的 refine 挂回原模型
+    model.refine_s16 = refine_1
     
-    # refine_2 = model.refine_s8.to(device)  # 需要你实现 SingleInputRefine 来适配 refine 的输入
-    # pruner_refine = tp.pruner.BasePruner(
-    #     refine_2,
-    #     dummy_input_refine2.unsqueeze(dim=0),
-    #     importance=imp,
-    #     pruning_ratio=prune_ratio,
-    #     # ignored_layers=ignored_layers_refine,
-    #     round_to=8,
-    # )
+    refine_2 = model.refine_s8.to(device)  # 需要你实现 SingleInputRefine 来适配 refine 的输入
+    pruner_refine = tp.pruner.BasePruner(
+        refine_2,
+        dummy_input_refine2.unsqueeze(dim=0),
+        importance=imp,
+        pruning_ratio=prune_ratio_2,
+        # ignored_layers=ignored_layers_refine,
+        round_to=8,
+    )
 
-    # print("=== 剪 refine 前 ===")
-    # tp.utils.print_tool.before_pruning(refine_2)
-    # pruner_refine.step()
-    # print("=== 剪 refine 后 ===")
-    # tp.utils.print_tool.after_pruning(refine_2)
+    print("=== 剪 refine 前 ===")
+    tp.utils.print_tool.before_pruning(refine_2)
+    pruner_refine.step()
+    print("=== 剪 refine 后 ===")
+    tp.utils.print_tool.after_pruning(refine_2)
 
-    # # 把剪过的 refine 挂回原模型
-    # model.refine_s8 = refine_2
+    # 把剪过的 refine 挂回原模型
+    model.refine_s8 = refine_2
     
     macs, nparams = tp.utils.count_ops_and_params(model, (image1, image2))
     print(f"MACs: {base_macs/1e9} G -> {macs/1e9} G, #Params: {base_nparams/1e6} M -> {nparams/1e6} M")
@@ -141,8 +149,14 @@ def count_active_params_all(model):
 import torch.optim as optim
 from tqdm import tqdm  # 进度条工具
 
-def finetune(model, dataloader, device,i, epochs=5):
+def finetune(model, dataset, device,i, epochs=5):
+    log_file = './prune/log_results.txt'
+    with open(log_file, 'a') as f:
+        f.write(f'iteration {i}' )
+        f.write('\n')
     torch.backends.cudnn.benchmark = True
+    
+    
     model = model.float()
     """
     简单的微调函数
@@ -152,14 +166,45 @@ def finetune(model, dataloader, device,i, epochs=5):
         device: 设备 (cuda/cpu)
         epochs: 微调轮次
     """
+    if args.distributed:
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device(f'cuda:{args.local_rank}')
+
+        dist.init_process_group(backend="nccl", init_method="env://")
+        args.world_size = dist.get_world_size()
+        args.rank = dist.get_rank()
+
+        # 调整 batch_size
+        assert args.batch_size % args.world_size == 0, \
+            f"Batch size {args.batch_size} must be divisible by world size {args.world_size}"
+        args.batch_size = args.batch_size // args.world_size
+
+        # 用 DDP 包裹模型
+        model = DDP(model.to(device), device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+        model_without_ddp = model.module
+    else:
+        model = model.to(device)
+        model_without_ddp = model
+    
+    if args.distributed:
+        train_sampler = DistributedSampler(dataset, num_replicas=args.world_size, rank=args.rank, shuffle=True)
+    else:
+        train_sampler = None
+    
+    shuffle = False if args.distributed else True
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        sampler=train_sampler,   # 这里控制了数据切分
+        shuffle=shuffle,  # 分布式时不需要 shuffle
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
+
+
     scaler = torch.cuda.amp.GradScaler()
-    # optimizer = torch.optim.SGD(
-    #     model.parameters(),
-    #     lr=1e-6,          # 初始学习率可增大
-    #     momentum=0.9,     # 动量缓冲
-    #     weight_decay=1e-5, # 权重衰减
-    #     nesterov=True     # Nesterov加速
-    # )
     # 使用更稳定的优化器配置
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -170,10 +215,17 @@ def finetune(model, dataloader, device,i, epochs=5):
     # 必须配合梯度裁剪使用
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
     step=0
+    counter=0
+    
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
-        progress_bar = tqdm(dataloader, desc=f'Finetune Epoch {epoch+1}/{epochs}')
+        
+        if args.distributed:
+            dataloader.sampler.set_epoch(epoch)  # 保证 shuffle 在分布式下不同步
+
+        progress_bar = tqdm(dataloader, desc=f'Finetune Epoch {epoch+1}/{epochs}', disable=args.local_rank != 0)
+
         
         for image1, image2, flow_gt, valid in progress_bar:
             optimizer.zero_grad()
@@ -181,8 +233,7 @@ def finetune(model, dataloader, device,i, epochs=5):
             img2 = image2.to(device)
             flow_gt = flow_gt.to(device)
             valid = valid.to(device)
-            # img1 = ima1.half()
-            # img2 = img2.half()
+
 
             model.init_bhwd(img1.shape[0], img1.shape[-2], img1.shape[-1], device)
 
@@ -217,27 +268,33 @@ def finetune(model, dataloader, device,i, epochs=5):
             
             epoch_loss += loss.item()
             progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
-        
-       
-        
-        print(f'Epoch {epoch+1} Average Loss: {epoch_loss/len(dataloader):.4f}')
-        step+=1
-        if step%20==0:
-            torch.save(model, f'./prune/finetune_backbone_{i}_{step}.pth')
-            print('model saved to:', f'./prune/finetune_backbone_{i}_{step}.pth')
-        log_file = './prune/log_results.txt'
-        with open(log_file, 'a') as f:
-            f.write(f'Epoch {step} Average Loss: {epoch_loss/len(dataloader):.4f}')
-            f.write('\n')
+            
+        counter += 1
+
+        if counter >= 10:
+
+            for group in optimizer.param_groups:
+                group['lr'] *= 0.8
+
+            counter = 0
+        if args.local_rank == 0:
+            print(f'Epoch {epoch+1} Average Loss: {epoch_loss/len(dataloader):.4f}')
+            step+=1
+            if step%20==0:
+                torch.save(model, f'./prune/finetune_backbone_{i}_{step}.pth')
+                print('model saved to:', f'./prune/finetune_backbone_{i}_{step}.pth')
+            with open(log_file, 'a') as f:
+                f.write(f'Epoch {step} Average Loss: {epoch_loss/len(dataloader):.4f}')
+                f.write('\n')
 
     model.eval()  # 微调完成后切换回评估模式
     return model
     
 device=torch.device("cuda"if torch.cuda.is_available() else "cpu")
-model = NeuFlow().to(device)
-checkpoint = torch.load('./neuflow_things.pth', map_location='cuda', weights_only=True)
-model.load_state_dict(checkpoint['model'], strict=True)
-# model = torch.load('./prune/pruned_model_backbone_0.pth',weights_only=False) 
+# model = NeuFlow().to(device)
+# checkpoint = torch.load('./neuflow_things.pth', map_location='cuda', weights_only=True)
+# model.load_state_dict(checkpoint['model'], strict=True)
+model = torch.load(args.resume,weights_only=False) 
 
 
 # print(model.backbone)
@@ -247,22 +304,20 @@ aug_params = {'crop_size': crop_size, 'min_scale': -0.2, 'max_scale': 0.4, 'do_f
 kitti2012 = datasets.KITTI(aug_params, split='training',year=2012)
 # kitti2015 = datasets.KITTI(aug_params, split='training',year=2015)
 aug_params = {'crop_size': crop_size, 'min_scale': -0.2, 'max_scale': 0.6, 'do_flip': True}
-sintel_clean = datasets.MpiSintelSubset(aug_params, split='training', dstype='clean', subset_ratio=0.3)
-sintel_final = datasets.MpiSintelSubset(aug_params, split='training', dstype='final', subset_ratio=0.3)
+sintel_clean = datasets.MpiSintelSubset(aug_params, split='training', dstype='clean', subset_ratio=0.5)
+sintel_final = datasets.MpiSintelSubset(aug_params, split='training', dstype='final', subset_ratio=0.5)
+middlebury = datasets.Middlebury(aug_params)
 aug_params = {'crop_size': crop_size, 'min_scale': -0.1, 'max_scale': 1.0, 'do_flip': True}
-chair = datasets.FlyingChairsSubset(aug_params, split='training')
-dataset = sintel_clean + sintel_final + kitti2012 + chair
+chair = datasets.FlyingChairsSubset(aug_params, split='training',subset_ratio=0.3)
+
+dataset = sintel_clean + sintel_final + middlebury + kitti2012 + chair
 
     
-iterative_steps = 1 # You can prune your model to the target pruning ratio iteratively.
+iterative_steps = 5 # You can prune your model to the target pruning ratio iteratively.
 i=0
 record=False
 
-finetune_loader = torch.utils.data.DataLoader(
-    dataset, 
-    batch_size=16, 
-    shuffle=True  # 微调时需要打乱数据
-)
+
 log_file = './prune/log_results.txt'
         
 # for input_id in range(len(dataset)):
@@ -294,16 +349,16 @@ while i < iterative_steps:
     print("="*16)
     # 2. finetune your model here
     print("开始微调")
-    model = finetune(model, finetune_loader, device, epochs=160,i=i)
+    model = finetune(model, dataset, device, epochs=80,i=i)
     print("微调完成")
     model.zero_grad() # We don't want to store gradient information
-    torch.save(model, f'./prune/pruned_model_backbone_{i}.pth')
+    torch.save(model, f'./prune/pruned_model_mix_{i}.pth')
     i+=1
 print(model.backbone)
 
 # 4. Save & Load
 model.zero_grad() # clear gradients to avoid a large file size
-torch.save(model, './prune/pruned_model_backbone.pth') # !! no .state_dict here since the structure has been changed after pruning
+torch.save(model, './prune/pruned_model_mix.pth') # !! no .state_dict here since the structure has been changed after pruning
 
 
 
